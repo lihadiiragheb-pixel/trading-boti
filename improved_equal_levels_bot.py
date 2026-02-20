@@ -1,6 +1,6 @@
 """
 تحسين بوت Equal Lows/Highs - نسخة محسّنة مع إدارة صفقات كاملة
-Improved Equal Lows/Highs Bot with Real Binance, Telegram & Trailing Stop Loss
+Improved Equal Lows/Highs Bot with Real Binance, Telegram, Trailing Stop & Retest Logic
 """
 
 import os
@@ -92,10 +92,11 @@ class BinanceClientManager:
             print(f"❌ فشل تنفيذ الأمر: {e}")
             return None
 
-# ===== Trade Manager Class with Trailing Stop Loss =====
+# ===== Trade Manager Class with Trailing & Retest Support =====
 class TradeManager:
     def __init__(self, tg_token: str = "", tg_chat_id: str = ""):
         self.open_trade: Optional[Dict] = None
+        self.pending_retest: Optional[Dict] = None  # لتخزين إشارات الكسر التي تنتظر إعادة الاختبار
         self.closed_trades = []
         self.total_profit = 0
         self.total_loss = 0
@@ -106,6 +107,16 @@ class TradeManager:
         # إعدادات تتبع الوقف (Trailing)
         self.trailing_trigger_pct = 0.01  # تفعيل عند ربح 1%
         self.trailing_offset_pct = 0.005  # الحفاظ على مسافة 0.5% من السعر الحالي
+
+    def set_pending_retest(self, side: str, level: float, timestamp: float):
+        self.pending_retest = {
+            "side": side,
+            "level": level,
+            "timestamp": timestamp,
+            "expiry": timestamp + 3600 # الإشارة صالحة لمدة ساعة (60 دقيقة)
+        }
+        msg = f"🔍 *رصد كسر للمستوى ({side})*\n📏 المستوى: {level:.2f}\n⏳ بانتظار إعادة الاختبار (Retest)..."
+        send_telegram_message(self.tg_token, self.tg_chat_id, msg)
 
     def open_position(self, side: str, entry_price: float, stop_price: float, 
                      tp_price: float, qty: float, timestamp: float) -> Dict:
@@ -122,7 +133,8 @@ class TradeManager:
             "highest_price": entry_price if side == "BUY" else 999999999,
             "lowest_price": entry_price if side == "SELL" else 0
         }
-        msg = f"🚀 *فتح صفقة جديدة ({side})*\n💰 السعر: {entry_price:.2f}\n🛑 الوقف: {stop_price:.2f}\n🎯 الهدف: {tp_price:.2f}\n📦 الكمية: {qty}"
+        self.pending_retest = None # مسح إشارة الانتظار بعد الدخول
+        msg = f"🚀 *تم تأكيد إعادة الاختبار - فتح صفقة ({side})*\n💰 السعر: {entry_price:.2f}\n🛑 الوقف: {stop_price:.2f}\n🎯 الهدف: {tp_price:.2f}\n📦 الكمية: {qty}"
         send_telegram_message(self.tg_token, self.tg_chat_id, msg)
         return self.open_trade
 
@@ -136,14 +148,12 @@ class TradeManager:
         # تحديث ملاحقة الوقف (Trailing Logic)
         self._update_trailing_stop(current_price)
 
-        # التحقق من شروط الإغلاق (الوقف المحدث أو الهدف)
+        # التحقق من شروط الإغلاق
         if trade["side"] == "BUY":
             if current_price <= trade["stop_price"]:
                 pnl = (current_price - trade["entry_price"]) * trade["qty"]
                 closed_trade = self._close_trade(current_price, timestamp, "STOP_LOSS/TRAILING", pnl)
             elif current_price >= trade["tp_price"] and not trade["is_trailing"]:
-                # إذا وصل للهدف ولم نكن في وضع التتبع، يمكننا اختيار الإغلاق أو البدء في التتبع
-                # هنا سنغلق الصفقة كما في الاستراتيجية الأصلية، أو يمكن تحويلها لتتبع مفتوح
                 pnl = (current_price - trade["entry_price"]) * trade["qty"]
                 closed_trade = self._close_trade(current_price, timestamp, "TAKE_PROFIT", pnl)
         
@@ -162,36 +172,24 @@ class TradeManager:
         if not trade: return
 
         if trade["side"] == "BUY":
-            # تحديث أعلى سعر وصل إليه السعر
             if current_price > trade["highest_price"]:
                 trade["highest_price"] = current_price
-            
-            # حساب الربح الحالي كنسبة
             profit_pct = (current_price - trade["entry_price"]) / trade["entry_price"]
-            
-            # تفعيل تتبع الوقف عند وصول الربح لـ 1%
             if profit_pct >= self.trailing_trigger_pct:
                 new_stop = current_price * (1 - self.trailing_offset_pct)
                 if new_stop > trade["stop_price"]:
-                    old_stop = trade["stop_price"]
                     trade["stop_price"] = new_stop
                     if not trade["is_trailing"]:
                         trade["is_trailing"] = True
                         send_telegram_message(self.tg_token, self.tg_chat_id, f"🎯 *تفعيل تتبع الوقف*\nتم تأمين الربح عند: {new_stop:.2f}")
         
         elif trade["side"] == "SELL":
-            # تحديث أدنى سعر وصل إليه السعر
             if current_price < trade["lowest_price"]:
                 trade["lowest_price"] = current_price
-            
-            # حساب الربح الحالي كنسبة
             profit_pct = (trade["entry_price"] - current_price) / trade["entry_price"]
-            
-            # تفعيل تتبع الوقف عند وصول الربح لـ 1%
             if profit_pct >= self.trailing_trigger_pct:
                 new_stop = current_price * (1 + self.trailing_offset_pct)
                 if new_stop < trade["stop_price"]:
-                    old_stop = trade["stop_price"]
                     trade["stop_price"] = new_stop
                     if not trade["is_trailing"]:
                         trade["is_trailing"] = True
@@ -204,19 +202,16 @@ class TradeManager:
         trade["reason"] = reason
         trade["pnl"] = pnl
         trade["status"] = "CLOSED"
-
         self.closed_trades.append(trade)
         status_emoji = "✅" if pnl > 0 else "❌"
         msg = f"{status_emoji} *إغلاق صفقة ({trade['side']})*\n📝 السبب: {reason}\n📉 السعر: {exit_price:.2f}\n💵 الربح/الخسارة: {pnl:.2f}$"
         send_telegram_message(self.tg_token, self.tg_chat_id, msg)
-
         if pnl > 0:
             self.total_profit += pnl
             self.win_count += 1
         else:
             self.total_loss += abs(pnl)
             self.loss_count += 1
-
         self.open_trade = None
         return trade
 
@@ -229,23 +224,24 @@ def detect_equal_highs(df: pd.DataFrame) -> pd.Series:
     highs = df["high"].rolling(3).agg(lambda x: x.iloc[1] if x.iloc[1] == x.max() else np.nan)
     return highs.dropna()
 
-def check_long_signal(df: pd.DataFrame, volume_mult: float = 1.5) -> Tuple[bool, Optional[float]]:
+def check_breakout_signal(df: pd.DataFrame, volume_mult: float = 1.5) -> Tuple[bool, str, Optional[float]]:
+    # التحقق من الشراء (Long)
     equal_lows = detect_equal_lows(df)
-    if len(equal_lows) < 1: return False, None
-    last_equal = equal_lows.iloc[-1]
-    avg_volume = df["volume"].rolling(20).mean().iloc[-1]
-    if df["low"].iloc[-1] < last_equal and df["volume"].iloc[-1] > avg_volume * volume_mult:
-        return True, last_equal
-    return False, None
-
-def check_short_signal(df: pd.DataFrame, volume_mult: float = 1.5) -> Tuple[bool, Optional[float]]:
+    if len(equal_lows) >= 1:
+        last_equal = equal_lows.iloc[-1]
+        avg_volume = df["volume"].rolling(20).mean().iloc[-1]
+        if df["low"].iloc[-1] < last_equal and df["volume"].iloc[-1] > avg_volume * volume_mult:
+            return True, "BUY", last_equal
+            
+    # التحقق من البيع (Short)
     equal_highs = detect_equal_highs(df)
-    if len(equal_highs) < 1: return False, None
-    last_equal = equal_highs.iloc[-1]
-    avg_volume = df["volume"].rolling(20).mean().iloc[-1]
-    if df["high"].iloc[-1] > last_equal and df["volume"].iloc[-1] > avg_volume * volume_mult:
-        return True, last_equal
-    return False, None
+    if len(equal_highs) >= 1:
+        last_equal = equal_highs.iloc[-1]
+        avg_volume = df["volume"].rolling(20).mean().iloc[-1]
+        if df["high"].iloc[-1] > last_equal and df["volume"].iloc[-1] > avg_volume * volume_mult:
+            return True, "SELL", last_equal
+            
+    return False, "", None
 
 def calc_position_size(balance: float, entry_price: float, stop_price: float, risk_pct: float = 0.005) -> float:
     risk_amount = balance * risk_pct
@@ -276,25 +272,48 @@ class EqualLevelsBot:
         current_price = df["close"].iloc[-1]
         current_time = datetime.now().timestamp()
 
+        # 1. التحقق من إغلاق الصفقات المفتوحة
         if self.trade_manager.open_trade:
             self.trade_manager.check_close_conditions(current_price, current_time)
             return
 
-        long_sig, level = check_long_signal(df, self.volume_mult)
-        if long_sig:
-            stop = level - (current_price * 0.002)
-            balance = self.client_manager.get_balance()
-            qty = calc_position_size(balance, current_price, stop, self.risk_pct)
-            tp = current_price + (current_price - stop) * self.rr_ratio
-            if self.client_manager.create_order(self.symbol, "BUY", qty):
-                self.trade_manager.open_position("BUY", current_price, stop, tp, qty, current_time)
+        # 2. التحقق من إعادة الاختبار (Retest) إذا كانت هناك إشارة انتظار
+        pending = self.trade_manager.pending_retest
+        if pending:
+            # التحقق من صلاحية الإشارة
+            if current_time > pending["expiry"]:
+                self.trade_manager.pending_retest = None
+                return
+
+            # منطق إعادة الاختبار (Retest Logic)
+            if pending["side"] == "BUY":
+                # انتظار العودة للمستوى المكسور (أو الاقتراب منه بنسبة 0.1%) ثم الارتداد للأعلى
+                if current_price <= pending["level"] * 1.001 and current_price >= pending["level"] * 0.999:
+                    stop = pending["level"] - (current_price * 0.002)
+                    balance = self.client_manager.get_balance()
+                    qty = calc_position_size(balance, current_price, stop, self.risk_pct)
+                    tp = current_price + (current_price - stop) * self.rr_ratio
+                    if self.client_manager.create_order(self.symbol, "BUY", qty):
+                        self.trade_manager.open_position("BUY", current_price, stop, tp, qty, current_time)
+            
+            elif pending["side"] == "SELL":
+                # انتظار العودة للمستوى المكسور (أو الاقتراب منه) ثم الارتداد للأسفل
+                if current_price >= pending["level"] * 0.999 and current_price <= pending["level"] * 1.001:
+                    stop = pending["level"] + (current_price * 0.002)
+                    balance = self.client_manager.get_balance()
+                    qty = calc_position_size(balance, current_price, stop, self.risk_pct)
+                    tp = current_price - (stop - current_price) * self.rr_ratio
+                    if self.client_manager.create_order(self.symbol, "SELL", qty):
+                        self.trade_manager.open_position("SELL", current_price, stop, tp, qty, current_time)
             return
 
-        short_sig, level = check_short_signal(df, self.volume_mult)
-        if short_sig:
-            stop = level + (current_price * 0.002)
-            balance = self.client_manager.get_balance()
-            qty = calc_position_size(balance, current_price, stop, self.risk_pct)
-            tp = current_price - (stop - current_price) * self.rr_ratio
-            if self.client_manager.create_order(self.symbol, "SELL", qty):
-                self.trade_manager.open_position("SELL", current_price, stop, tp, qty, current_time)
+        # 3. رصد إشارات كسر جديدة (Breakout)
+        has_signal, side, level = check_breakout_signal(df, self.volume_mult)
+        if has_signal:
+            self.trade_manager.set_pending_retest(side, level, current_time)
+
+if __name__ == "__main__":
+    bot = EqualLevelsBot()
+    for _ in range(5):
+        bot.run_iteration()
+        time.sleep(1)
