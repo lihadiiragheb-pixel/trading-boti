@@ -1,16 +1,28 @@
 """
 تحسين بوت Equal Lows/Highs - نسخة محسّنة مع إدارة صفقات كاملة
-Improved Equal Lows/Highs Bot with Real Binance Integration
+Improved Equal Lows/Highs Bot with Real Binance & Telegram Integration
 """
 
 import os
 import time
+import requests
 import numpy as np
 import pandas as pd
 from datetime import datetime
 from typing import Optional, Tuple, Dict
 from binance.client import Client
 from binance.enums import *
+
+# ===== Telegram Notification Setup =====
+def send_telegram_message(token: str, chat_id: str, message: str):
+    if not token or not chat_id:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
+        requests.post(url, json=payload)
+    except Exception as e:
+        print(f"❌ خطأ في إرسال إشعار تلجرام: {e}")
 
 # ===== Binance Client Setup =====
 class BinanceClientManager:
@@ -42,7 +54,6 @@ class BinanceClientManager:
             return None
 
     def _get_simulated_klines(self, limit):
-        # محاكاة البيانات للاختبار
         data = []
         current_price = 50000
         for i in range(limit):
@@ -83,13 +94,15 @@ class BinanceClientManager:
 
 # ===== Trade Manager Class =====
 class TradeManager:
-    def __init__(self):
+    def __init__(self, tg_token: str = "", tg_chat_id: str = ""):
         self.open_trade: Optional[Dict] = None
         self.closed_trades = []
         self.total_profit = 0
         self.total_loss = 0
         self.win_count = 0
         self.loss_count = 0
+        self.tg_token = tg_token
+        self.tg_chat_id = tg_chat_id
 
     def open_position(self, side: str, entry_price: float, stop_price: float, 
                      tp_price: float, qty: float, timestamp: float) -> Dict:
@@ -102,6 +115,8 @@ class TradeManager:
             "entry_time": timestamp,
             "status": "OPEN"
         }
+        msg = f"🚀 *فتح صفقة جديدة ({side})*\n💰 السعر: {entry_price:.2f}\n🛑 الوقف: {stop_price:.2f}\n🎯 الهدف: {tp_price:.2f}\n📦 الكمية: {qty}"
+        send_telegram_message(self.tg_token, self.tg_chat_id, msg)
         return self.open_trade
 
     def check_close_conditions(self, current_price: float, timestamp: float) -> Optional[Dict]:
@@ -135,6 +150,10 @@ class TradeManager:
         trade["status"] = "CLOSED"
 
         self.closed_trades.append(trade)
+        status_emoji = "✅" if pnl > 0 else "❌"
+        msg = f"{status_emoji} *إغلاق صفقة ({trade['side']})*\n📝 السبب: {reason}\n📉 السعر: {exit_price:.2f}\n💵 الربح/الخسارة: {pnl:.2f}$"
+        send_telegram_message(self.tg_token, self.tg_chat_id, msg)
+
         if pnl > 0:
             self.total_profit += pnl
             self.win_count += 1
@@ -144,14 +163,6 @@ class TradeManager:
 
         self.open_trade = None
         return trade
-
-    def get_statistics(self) -> Dict:
-        total_trades = len(self.closed_trades)
-        return {
-            "total_trades": total_trades,
-            "win_rate": (self.win_count / total_trades * 100) if total_trades > 0 else 0,
-            "net_profit": self.total_profit - self.total_loss
-        }
 
 # ===== Strategy Logic =====
 def detect_equal_lows(df: pd.DataFrame) -> pd.Series:
@@ -191,7 +202,8 @@ class EqualLevelsBot:
     def __init__(self, symbol: str = "BTCUSDT", timeframe: str = "1m", 
                  rr_ratio: float = 2.0, volume_mult: float = 1.5, 
                  risk_pct: float = 0.005, lookback: int = 50,
-                 api_key: str = "", api_secret: str = ""):
+                 api_key: str = "", api_secret: str = "",
+                 tg_token: str = "", tg_chat_id: str = ""):
         self.symbol = symbol
         self.timeframe = timeframe
         self.rr_ratio = rr_ratio
@@ -199,7 +211,9 @@ class EqualLevelsBot:
         self.risk_pct = risk_pct
         self.lookback = lookback
         self.client_manager = BinanceClientManager(api_key, api_secret)
-        self.trade_manager = TradeManager()
+        self.trade_manager = TradeManager(tg_token, tg_chat_id)
+        self.tg_token = tg_token
+        self.tg_chat_id = tg_chat_id
 
     def run_iteration(self):
         df = self.client_manager.get_klines(self.symbol, self.timeframe, self.lookback)
@@ -209,9 +223,7 @@ class EqualLevelsBot:
         current_time = datetime.now().timestamp()
 
         if self.trade_manager.open_trade:
-            closed = self.trade_manager.check_close_conditions(current_price, current_time)
-            if closed:
-                print(f"✅ تم إغلاق الصفقة: {closed['reason']} | الربح: {closed['pnl']:.2f}")
+            self.trade_manager.check_close_conditions(current_price, current_time)
             return
 
         long_sig, level = check_long_signal(df, self.volume_mult)
@@ -222,7 +234,6 @@ class EqualLevelsBot:
             tp = current_price + (current_price - stop) * self.rr_ratio
             if self.client_manager.create_order(self.symbol, "BUY", qty):
                 self.trade_manager.open_position("BUY", current_price, stop, tp, qty, current_time)
-                print(f"🚀 فتح صفقة شراء: {current_price} | الهدف: {tp}")
             return
 
         short_sig, level = check_short_signal(df, self.volume_mult)
@@ -233,11 +244,3 @@ class EqualLevelsBot:
             tp = current_price - (stop - current_price) * self.rr_ratio
             if self.client_manager.create_order(self.symbol, "SELL", qty):
                 self.trade_manager.open_position("SELL", current_price, stop, tp, qty, current_time)
-                print(f"🚀 فتح صفقة بيع: {current_price} | الهدف: {tp}")
-
-if __name__ == "__main__":
-    # للاختبار المحلي فقط
-    bot = EqualLevelsBot()
-    for _ in range(10):
-        bot.run_iteration()
-        time.sleep(1)

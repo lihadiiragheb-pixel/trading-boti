@@ -1,13 +1,13 @@
 """
-تشغيل البوت على Render / VPS - مع دعم كامل لمتغيرات البيئة
-Bot Runner for Continuous Execution
+تشغيل البوت على Render / VPS - مع دعم كامل لمتغيرات البيئة وتلجرام
+Bot Runner for Continuous Execution with Telegram
 """
 
 import os
 import time
 import logging
 from datetime import datetime
-from improved_equal_levels_bot import EqualLevelsBot
+from improved_equal_levels_bot import EqualLevelsBot, send_telegram_message
 
 # إعداد السجلات (Logging)
 logging.basicConfig(
@@ -24,6 +24,8 @@ def main():
     # الحصول على متغيرات البيئة من Render
     api_key = os.getenv("BINANCE_API_KEY", "")
     api_secret = os.getenv("BINANCE_API_SECRET", "")
+    tg_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    tg_chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
     symbol = os.getenv("SYMBOL", "BTCUSDT")
     timeframe = os.getenv("TIMEFRAME", "1m")
     rr_ratio = float(os.getenv("RR_RATIO", "2.0"))
@@ -31,12 +33,12 @@ def main():
     risk_pct = float(os.getenv("RISK_PCT", "0.005"))
     lookback = int(os.getenv("LOOKBACK", "50"))
     
-    if not api_key or not api_secret:
-        logger.warning("⚠️ لم يتم العثور على مفاتيح API في متغيرات البيئة!")
-        logger.info("سيتم تشغيل البوت في وضع المحاكاة (Paper Trading)...")
-    else:
-        logger.info(f"✅ تم العثور على مفاتيح API للزوج: {symbol}")
-    
+    # إرسال إشعار بدء التشغيل لتلجرام
+    if tg_token and tg_chat_id:
+        mode = "حقيقي ✅" if api_key else "تجريبي (محاكاة) 🧪"
+        start_msg = f"🤖 *تم بدء تشغيل البوت على Render*\n📈 الزوج: {symbol}\n⏰ الإطار: {timeframe}\n⚙️ الوضع: {mode}"
+        send_telegram_message(tg_token, tg_chat_id, start_msg)
+
     # إنشاء البوت
     try:
         bot = EqualLevelsBot(
@@ -47,11 +49,15 @@ def main():
             risk_pct=risk_pct,
             lookback=lookback,
             api_key=api_key,
-            api_secret=api_secret
+            api_secret=api_secret,
+            tg_token=tg_token,
+            tg_chat_id=tg_chat_id
         )
         logger.info("✅ تم بناء محرك البوت بنجاح")
     except Exception as e:
         logger.error(f"❌ خطأ في إنشاء البوت: {e}")
+        if tg_token and tg_chat_id:
+            send_telegram_message(tg_token, tg_chat_id, f"❌ *خطأ حرج عند بدء البوت:*\n`{str(e)}`")
         return
 
     # حلقة التشغيل اللانهائية
@@ -59,21 +65,15 @@ def main():
     while True:
         try:
             iteration += 1
-            # logger.info(f"🔄 دورة #{iteration} - {datetime.now().strftime('%H:%M:%S')}")
-            
-            # تشغيل دورة واحدة من الاستراتيجية
             bot.run_iteration()
-            
-            # الانتظار لمدة دقيقة (أو حسب التايم فريم)
-            # بما أن التايم فريم دقيقة، ننتظر 60 ثانية
             time.sleep(60)
             
         except KeyboardInterrupt:
             logger.info("⛔ تم إيقاف البوت يدوياً")
             break
         except Exception as e:
-            logger.error(f"❌ خطأ غير متوقع في الدورة #{iteration}: {e}")
-            time.sleep(30) # انتظار قصير قبل إعادة المحاولة
+            logger.error(f"❌ خطأ في الدورة #{iteration}: {e}")
+            time.sleep(30)
 
 if __name__ == "__main__":
     main()
