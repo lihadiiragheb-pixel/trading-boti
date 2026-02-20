@@ -1,0 +1,126 @@
+import time
+import numpy as np
+import pandas as pd
+from binance.client import Client
+from binance.enums import *
+
+# ===== Binance Keys =====
+API_KEY = "YOUR_API_KEY"
+API_SECRET = "YOUR_API_SECRET"
+
+client = Client(API_KEY, API_SECRET)
+
+# ===== Parameters =====
+SYMBOL = "BTCUSDT"
+TIMEFRAME = "1m"
+RR_RATIO = 2
+LOOKBACK = 50
+VOLUME_MULT = 1.5
+RISK_PCT = 0.5 / 100
+
+# ===== Utility Functions =====
+
+def get_klines(symbol, interval, limit=100):
+    data = client.get_klines(symbol=symbol, interval=interval, limit=limit)
+    df = pd.DataFrame(data, columns=[
+        "open_time", "open", "high", "low", "close",
+        "volume", "close_time", "qav", "trades", "bav", "qbv", "ignore"
+    ])
+    df["open"] = df["open"].astype(float)
+    df["high"] = df["high"].astype(float)
+    df["low"] = df["low"].astype(float)
+    df["close"] = df["close"].astype(float)
+    df["volume"] = df["volume"].astype(float)
+    return df
+
+def calc_position_size(balance, entry_price, stop_price):
+    risk_amount = balance * RISK_PCT
+    risk_per_unit = abs(entry_price - stop_price)
+    return round(risk_amount / risk_per_unit, 6)
+
+def place_order(side, qty):
+    try:
+        order = client.create_order(
+            symbol=SYMBOL,
+            side=side,
+            type=ORDER_TYPE_MARKET,
+            quantity=qty
+        )
+        print(f">>> {side} ORDER EXECUTED:", order)
+    except Exception as e:
+        print("Order failed:", e)
+
+# ===== Strategy Logic =====
+
+def detect_equal_lows(df):
+    lows = df["low"].rolling(3).agg(lambda x: x[1] if x[1] == min(x) else np.nan)
+    return lows.dropna()
+
+def detect_equal_highs(df):
+    highs = df["high"].rolling(3).agg(lambda x: x[1] if x[1] == max(x) else np.nan)
+    return highs.dropna()
+
+def check_long_signal(df):
+    equal_lows = detect_equal_lows(df)
+    if len(equal_lows) < 1:
+        return False, None
+
+    last_equal = equal_lows.iloc[-1]
+    current_low = df["low"].iloc[-1]
+    current_volume = df["volume"].iloc[-1]
+    avg_volume = df["volume"].rolling(20).mean().iloc[-1]
+
+    if current_low < last_equal and current_volume > avg_volume * VOLUME_MULT:
+        return True, last_equal
+    return False, None
+
+def check_short_signal(df):
+    equal_highs = detect_equal_highs(df)
+    if len(equal_highs) < 1:
+        return False, None
+
+    last_equal = equal_highs.iloc[-1]
+    current_high = df["high"].iloc[-1]
+    current_volume = df["volume"].iloc[-1]
+    avg_volume = df["volume"].rolling(20).mean().iloc[-1]
+
+    if current_high > last_equal and current_volume > avg_volume * VOLUME_MULT:
+        return True, last_equal
+    return False, None
+
+# ===== Main Bot Loop =====
+
+def run_bot():
+    print("Bot started...")
+    balance = float(client.get_asset_balance(asset="USDT")["free"])
+    print("USDT Balance:", balance)
+
+    while True:
+        df = get_klines(SYMBOL, TIMEFRAME, LOOKBACK)
+
+        # Check LONG
+        long_signal, long_level = check_long_signal(df)
+        if long_signal:
+            entry_price = df["close"].iloc[-1]
+            stop_price = long_level - (df["low"].iloc[-1] * 0.002)
+            qty = calc_position_size(balance, entry_price, stop_price)
+            print("Long signal ✔️", entry_price, stop_price, qty)
+            place_order(SIDE_BUY, qty)
+            tp_price = entry_price + (entry_price - stop_price) * RR_RATIO
+            print("TP:", tp_price)
+
+        # Check SHORT
+        short_signal, short_level = check_short_signal(df)
+        if short_signal:
+            entry_price = df["close"].iloc[-1]
+            stop_price = short_level + (df["high"].iloc[-1] * 0.002)
+            qty = calc_position_size(balance, entry_price, stop_price)
+            print("Short signal ✔️", entry_price, stop_price, qty)
+            place_order(SIDE_SELL, qty)
+            tp_price = entry_price - (stop_price - entry_price) * RR_RATIO
+            print("TP:", tp_price)
+
+        time.sleep(60)
+
+if __name__ == "__main__":
+    run_bot()
