@@ -1,6 +1,6 @@
 """
 تحسين بوت Equal Lows/Highs - نسخة محسّنة مع إدارة صفقات كاملة
-Improved Equal Lows/Highs Bot with Real Binance & Telegram Integration
+Improved Equal Lows/Highs Bot with Real Binance, Telegram & Trailing Stop Loss
 """
 
 import os
@@ -92,7 +92,7 @@ class BinanceClientManager:
             print(f"❌ فشل تنفيذ الأمر: {e}")
             return None
 
-# ===== Trade Manager Class =====
+# ===== Trade Manager Class with Trailing Stop Loss =====
 class TradeManager:
     def __init__(self, tg_token: str = "", tg_chat_id: str = ""):
         self.open_trade: Optional[Dict] = None
@@ -103,6 +103,9 @@ class TradeManager:
         self.loss_count = 0
         self.tg_token = tg_token
         self.tg_chat_id = tg_chat_id
+        # إعدادات تتبع الوقف (Trailing)
+        self.trailing_trigger_pct = 0.01  # تفعيل عند ربح 1%
+        self.trailing_offset_pct = 0.005  # الحفاظ على مسافة 0.5% من السعر الحالي
 
     def open_position(self, side: str, entry_price: float, stop_price: float, 
                      tp_price: float, qty: float, timestamp: float) -> Dict:
@@ -110,10 +113,14 @@ class TradeManager:
             "side": side,
             "entry_price": entry_price,
             "stop_price": stop_price,
+            "initial_stop": stop_price,
             "tp_price": tp_price,
             "qty": qty,
             "entry_time": timestamp,
-            "status": "OPEN"
+            "status": "OPEN",
+            "is_trailing": False,
+            "highest_price": entry_price if side == "BUY" else 999999999,
+            "lowest_price": entry_price if side == "SELL" else 0
         }
         msg = f"🚀 *فتح صفقة جديدة ({side})*\n💰 السعر: {entry_price:.2f}\n🛑 الوقف: {stop_price:.2f}\n🎯 الهدف: {tp_price:.2f}\n📦 الكمية: {qty}"
         send_telegram_message(self.tg_token, self.tg_chat_id, msg)
@@ -126,20 +133,69 @@ class TradeManager:
         trade = self.open_trade
         closed_trade = None
 
-        if trade["side"] == "BUY" and current_price <= trade["stop_price"]:
-            pnl = (current_price - trade["entry_price"]) * trade["qty"]
-            closed_trade = self._close_trade(current_price, timestamp, "STOP_LOSS", pnl)
-        elif trade["side"] == "SELL" and current_price >= trade["stop_price"]:
-            pnl = (trade["entry_price"] - current_price) * trade["qty"]
-            closed_trade = self._close_trade(current_price, timestamp, "STOP_LOSS", pnl)
-        elif trade["side"] == "BUY" and current_price >= trade["tp_price"]:
-            pnl = (current_price - trade["entry_price"]) * trade["qty"]
-            closed_trade = self._close_trade(current_price, timestamp, "TAKE_PROFIT", pnl)
-        elif trade["side"] == "SELL" and current_price <= trade["tp_price"]:
-            pnl = (trade["entry_price"] - current_price) * trade["qty"]
-            closed_trade = self._close_trade(current_price, timestamp, "TAKE_PROFIT", pnl)
+        # تحديث ملاحقة الوقف (Trailing Logic)
+        self._update_trailing_stop(current_price)
+
+        # التحقق من شروط الإغلاق (الوقف المحدث أو الهدف)
+        if trade["side"] == "BUY":
+            if current_price <= trade["stop_price"]:
+                pnl = (current_price - trade["entry_price"]) * trade["qty"]
+                closed_trade = self._close_trade(current_price, timestamp, "STOP_LOSS/TRAILING", pnl)
+            elif current_price >= trade["tp_price"] and not trade["is_trailing"]:
+                # إذا وصل للهدف ولم نكن في وضع التتبع، يمكننا اختيار الإغلاق أو البدء في التتبع
+                # هنا سنغلق الصفقة كما في الاستراتيجية الأصلية، أو يمكن تحويلها لتتبع مفتوح
+                pnl = (current_price - trade["entry_price"]) * trade["qty"]
+                closed_trade = self._close_trade(current_price, timestamp, "TAKE_PROFIT", pnl)
+        
+        elif trade["side"] == "SELL":
+            if current_price >= trade["stop_price"]:
+                pnl = (trade["entry_price"] - current_price) * trade["qty"]
+                closed_trade = self._close_trade(current_price, timestamp, "STOP_LOSS/TRAILING", pnl)
+            elif current_price <= trade["tp_price"] and not trade["is_trailing"]:
+                pnl = (trade["entry_price"] - current_price) * trade["qty"]
+                closed_trade = self._close_trade(current_price, timestamp, "TAKE_PROFIT", pnl)
 
         return closed_trade
+
+    def _update_trailing_stop(self, current_price: float):
+        trade = self.open_trade
+        if not trade: return
+
+        if trade["side"] == "BUY":
+            # تحديث أعلى سعر وصل إليه السعر
+            if current_price > trade["highest_price"]:
+                trade["highest_price"] = current_price
+            
+            # حساب الربح الحالي كنسبة
+            profit_pct = (current_price - trade["entry_price"]) / trade["entry_price"]
+            
+            # تفعيل تتبع الوقف عند وصول الربح لـ 1%
+            if profit_pct >= self.trailing_trigger_pct:
+                new_stop = current_price * (1 - self.trailing_offset_pct)
+                if new_stop > trade["stop_price"]:
+                    old_stop = trade["stop_price"]
+                    trade["stop_price"] = new_stop
+                    if not trade["is_trailing"]:
+                        trade["is_trailing"] = True
+                        send_telegram_message(self.tg_token, self.tg_chat_id, f"🎯 *تفعيل تتبع الوقف*\nتم تأمين الربح عند: {new_stop:.2f}")
+        
+        elif trade["side"] == "SELL":
+            # تحديث أدنى سعر وصل إليه السعر
+            if current_price < trade["lowest_price"]:
+                trade["lowest_price"] = current_price
+            
+            # حساب الربح الحالي كنسبة
+            profit_pct = (trade["entry_price"] - current_price) / trade["entry_price"]
+            
+            # تفعيل تتبع الوقف عند وصول الربح لـ 1%
+            if profit_pct >= self.trailing_trigger_pct:
+                new_stop = current_price * (1 + self.trailing_offset_pct)
+                if new_stop < trade["stop_price"]:
+                    old_stop = trade["stop_price"]
+                    trade["stop_price"] = new_stop
+                    if not trade["is_trailing"]:
+                        trade["is_trailing"] = True
+                        send_telegram_message(self.tg_token, self.tg_chat_id, f"🎯 *تفعيل تتبع الوقف*\nتم تأمين الربح عند: {new_stop:.2f}")
 
     def _close_trade(self, exit_price: float, timestamp: float, reason: str, pnl: float) -> Dict:
         trade = self.open_trade.copy()
@@ -212,8 +268,6 @@ class EqualLevelsBot:
         self.lookback = lookback
         self.client_manager = BinanceClientManager(api_key, api_secret)
         self.trade_manager = TradeManager(tg_token, tg_chat_id)
-        self.tg_token = tg_token
-        self.tg_chat_id = tg_chat_id
 
     def run_iteration(self):
         df = self.client_manager.get_klines(self.symbol, self.timeframe, self.lookback)
