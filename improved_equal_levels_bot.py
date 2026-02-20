@@ -1,6 +1,6 @@
 """
 تحسين بوت Equal Lows/Highs - نسخة محسّنة مع إدارة صفقات كاملة
-Improved Equal Lows/Highs Bot with Real Binance, Telegram, Trailing Stop & Retest Logic
+Improved Equal Lows/Highs Bot with Real Binance, Telegram, Trailing Stop, Retest & 5m Timeframe
 """
 
 import os
@@ -57,7 +57,7 @@ class BinanceClientManager:
         data = []
         current_price = 50000
         for i in range(limit):
-            timestamp = int((datetime.now().timestamp() - (limit - i) * 60) * 1000)
+            timestamp = int((datetime.now().timestamp() - (limit - i) * 300) * 1000) # 5m intervals
             open_price = current_price + np.random.uniform(-100, 100)
             close_price = open_price + np.random.uniform(-50, 50)
             high_price = max(open_price, close_price) + np.random.uniform(0, 50)
@@ -96,7 +96,7 @@ class BinanceClientManager:
 class TradeManager:
     def __init__(self, tg_token: str = "", tg_chat_id: str = ""):
         self.open_trade: Optional[Dict] = None
-        self.pending_retest: Optional[Dict] = None  # لتخزين إشارات الكسر التي تنتظر إعادة الاختبار
+        self.pending_retest: Optional[Dict] = None
         self.closed_trades = []
         self.total_profit = 0
         self.total_loss = 0
@@ -113,7 +113,7 @@ class TradeManager:
             "side": side,
             "level": level,
             "timestamp": timestamp,
-            "expiry": timestamp + 3600 # الإشارة صالحة لمدة ساعة (60 دقيقة)
+            "expiry": timestamp + 7200 # الإشارة صالحة لمدة ساعتين (لأننا على فريم 5 دقائق)
         }
         msg = f"🔍 *رصد كسر للمستوى ({side})*\n📏 المستوى: {level:.2f}\n⏳ بانتظار إعادة الاختبار (Retest)..."
         send_telegram_message(self.tg_token, self.tg_chat_id, msg)
@@ -133,7 +133,7 @@ class TradeManager:
             "highest_price": entry_price if side == "BUY" else 999999999,
             "lowest_price": entry_price if side == "SELL" else 0
         }
-        self.pending_retest = None # مسح إشارة الانتظار بعد الدخول
+        self.pending_retest = None
         msg = f"🚀 *تم تأكيد إعادة الاختبار - فتح صفقة ({side})*\n💰 السعر: {entry_price:.2f}\n🛑 الوقف: {stop_price:.2f}\n🎯 الهدف: {tp_price:.2f}\n📦 الكمية: {qty}"
         send_telegram_message(self.tg_token, self.tg_chat_id, msg)
         return self.open_trade
@@ -144,11 +144,8 @@ class TradeManager:
 
         trade = self.open_trade
         closed_trade = None
-
-        # تحديث ملاحقة الوقف (Trailing Logic)
         self._update_trailing_stop(current_price)
 
-        # التحقق من شروط الإغلاق
         if trade["side"] == "BUY":
             if current_price <= trade["stop_price"]:
                 pnl = (current_price - trade["entry_price"]) * trade["qty"]
@@ -225,7 +222,6 @@ def detect_equal_highs(df: pd.DataFrame) -> pd.Series:
     return highs.dropna()
 
 def check_breakout_signal(df: pd.DataFrame, volume_mult: float = 1.5) -> Tuple[bool, str, Optional[float]]:
-    # التحقق من الشراء (Long)
     equal_lows = detect_equal_lows(df)
     if len(equal_lows) >= 1:
         last_equal = equal_lows.iloc[-1]
@@ -233,7 +229,6 @@ def check_breakout_signal(df: pd.DataFrame, volume_mult: float = 1.5) -> Tuple[b
         if df["low"].iloc[-1] < last_equal and df["volume"].iloc[-1] > avg_volume * volume_mult:
             return True, "BUY", last_equal
             
-    # التحقق من البيع (Short)
     equal_highs = detect_equal_highs(df)
     if len(equal_highs) >= 1:
         last_equal = equal_highs.iloc[-1]
@@ -243,7 +238,7 @@ def check_breakout_signal(df: pd.DataFrame, volume_mult: float = 1.5) -> Tuple[b
             
     return False, "", None
 
-def calc_position_size(balance: float, entry_price: float, stop_price: float, risk_pct: float = 0.005) -> float:
+def calc_position_size(balance: float, entry_price: float, stop_price: float, risk_pct: float = 0.01) -> float:
     risk_amount = balance * risk_pct
     risk_per_unit = abs(entry_price - stop_price)
     if risk_per_unit == 0: return 0
@@ -251,9 +246,9 @@ def calc_position_size(balance: float, entry_price: float, stop_price: float, ri
 
 # ===== Main Bot Class =====
 class EqualLevelsBot:
-    def __init__(self, symbol: str = "BTCUSDT", timeframe: str = "1m", 
+    def __init__(self, symbol: str = "BTCUSDT", timeframe: str = "5m", 
                  rr_ratio: float = 2.0, volume_mult: float = 1.5, 
-                 risk_pct: float = 0.005, lookback: int = 50,
+                 risk_pct: float = 0.01, lookback: int = 50,
                  api_key: str = "", api_secret: str = "",
                  tg_token: str = "", tg_chat_id: str = ""):
         self.symbol = symbol
@@ -272,24 +267,19 @@ class EqualLevelsBot:
         current_price = df["close"].iloc[-1]
         current_time = datetime.now().timestamp()
 
-        # 1. التحقق من إغلاق الصفقات المفتوحة
         if self.trade_manager.open_trade:
             self.trade_manager.check_close_conditions(current_price, current_time)
             return
 
-        # 2. التحقق من إعادة الاختبار (Retest) إذا كانت هناك إشارة انتظار
         pending = self.trade_manager.pending_retest
         if pending:
-            # التحقق من صلاحية الإشارة
             if current_time > pending["expiry"]:
                 self.trade_manager.pending_retest = None
                 return
 
-            # منطق إعادة الاختبار (Retest Logic)
             if pending["side"] == "BUY":
-                # انتظار العودة للمستوى المكسور (أو الاقتراب منه بنسبة 0.1%) ثم الارتداد للأعلى
-                if current_price <= pending["level"] * 1.001 and current_price >= pending["level"] * 0.999:
-                    stop = pending["level"] - (current_price * 0.002)
+                if current_price <= pending["level"] * 1.002 and current_price >= pending["level"] * 0.998:
+                    stop = pending["level"] - (current_price * 0.003) # Slightly wider stop for 5m
                     balance = self.client_manager.get_balance()
                     qty = calc_position_size(balance, current_price, stop, self.risk_pct)
                     tp = current_price + (current_price - stop) * self.rr_ratio
@@ -297,9 +287,8 @@ class EqualLevelsBot:
                         self.trade_manager.open_position("BUY", current_price, stop, tp, qty, current_time)
             
             elif pending["side"] == "SELL":
-                # انتظار العودة للمستوى المكسور (أو الاقتراب منه) ثم الارتداد للأسفل
-                if current_price >= pending["level"] * 0.999 and current_price <= pending["level"] * 1.001:
-                    stop = pending["level"] + (current_price * 0.002)
+                if current_price >= pending["level"] * 0.998 and current_price <= pending["level"] * 1.002:
+                    stop = pending["level"] + (current_price * 0.003)
                     balance = self.client_manager.get_balance()
                     qty = calc_position_size(balance, current_price, stop, self.risk_pct)
                     tp = current_price - (stop - current_price) * self.rr_ratio
@@ -307,13 +296,6 @@ class EqualLevelsBot:
                         self.trade_manager.open_position("SELL", current_price, stop, tp, qty, current_time)
             return
 
-        # 3. رصد إشارات كسر جديدة (Breakout)
         has_signal, side, level = check_breakout_signal(df, self.volume_mult)
         if has_signal:
             self.trade_manager.set_pending_retest(side, level, current_time)
-
-if __name__ == "__main__":
-    bot = EqualLevelsBot()
-    for _ in range(5):
-        bot.run_iteration()
-        time.sleep(1)
