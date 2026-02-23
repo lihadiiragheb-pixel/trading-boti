@@ -1,96 +1,19 @@
-"""
-تحسين بوت Equal Lows/Highs - نسخة محسّنة مع إدارة صفقات كاملة
-Improved Equal Lows/Highs Bot with Real Binance, Telegram, Trailing Stop, Retest & 5m Timeframe
-"""
-
 import os
 import time
-import requests
 import numpy as np
 import pandas as pd
 from datetime import datetime
 from typing import Optional, Tuple, Dict
-from binance.client import Client
-from binance.enums import *
+import logging
 
-# ===== Telegram Notification Setup =====
-def send_telegram_message(token: str, chat_id: str, message: str):
-    if not token or not chat_id:
-        return
-    try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
-        requests.post(url, json=payload)
-    except Exception as e:
-        print(f"❌ خطأ في إرسال إشعار تلجرام: {e}")
+from telegram_notifier import send_telegram_message
+from binance_client_manager import BinanceClientManager
 
-# ===== Binance Client Setup =====
-class BinanceClientManager:
-    def __init__(self, api_key: str = "", api_secret: str = ""):
-        self.api_key = api_key
-        self.api_secret = api_secret
-        if api_key and api_secret:
-            self.client = Client(api_key, api_secret)
-            print("✅ تم الاتصال ببايننس بنجاح (حساب حقيقي)")
-        else:
-            self.client = None
-            print("⚠️ لم يتم توفير مفاتيح API، البوت سيعمل في وضع المحاكاة فقط")
+logger = logging.getLogger(__name__)
 
-    def get_klines(self, symbol, interval, limit=100):
-        if not self.client:
-            return self._get_simulated_klines(limit)
-        
-        try:
-            data = self.client.get_klines(symbol=symbol, interval=interval, limit=limit)
-            df = pd.DataFrame(data, columns=[
-                "open_time", "open", "high", "low", "close",
-                "volume", "close_time", "qav", "trades", "bav", "qbv", "ignore"
-            ])
-            for col in ["open", "high", "low", "close", "volume"]:
-                df[col] = df[col].astype(float)
-            return df
-        except Exception as e:
-            print(f"❌ خطأ في جلب البيانات: {e}")
-            return None
-
-    def _get_simulated_klines(self, limit):
-        data = []
-        current_price = 50000
-        for i in range(limit):
-            timestamp = int((datetime.now().timestamp() - (limit - i) * 300) * 1000) # 5m intervals
-            open_price = current_price + np.random.uniform(-100, 100)
-            close_price = open_price + np.random.uniform(-50, 50)
-            high_price = max(open_price, close_price) + np.random.uniform(0, 50)
-            low_price = min(open_price, close_price) - np.random.uniform(0, 50)
-            data.append([timestamp, str(open_price), str(high_price), str(low_price), str(close_price), "100", 0, "0", 0, "0", "0", "0"])
-        
-        df = pd.DataFrame(data, columns=["open_time", "open", "high", "low", "close", "volume", "close_time", "qav", "trades", "bav", "qbv", "ignore"])
-        for col in ["open", "high", "low", "close", "volume"]:
-            df[col] = df[col].astype(float)
-        return df
-
-    def get_balance(self, asset="USDT"):
-        if not self.client:
-            return 1000.0
-        try:
-            return float(self.client.get_asset_balance(asset=asset)["free"])
-        except:
-            return 0.0
-
-    def create_order(self, symbol, side, qty):
-        if not self.client:
-            return {"orderId": "SIM_123", "status": "FILLED"}
-        try:
-            side_type = SIDE_BUY if side == "BUY" else SIDE_SELL
-            return self.client.create_order(
-                symbol=symbol,
-                side=side_type,
-                type=ORDER_TYPE_MARKET,
-                quantity=qty
-            )
-        except Exception as e:
-            print(f"❌ فشل تنفيذ الأمر: {e}")
-            return None
+# ===== Utility Functions for Strategy Filters =====
+def calculate_sma(df: pd.DataFrame, window: int = 20) -> pd.Series:
+    return df['close'].rolling(window=window).mean()
 
 # ===== Trade Manager Class with Trailing & Retest Support =====
 class TradeManager:
@@ -107,8 +30,27 @@ class TradeManager:
         # إعدادات تتبع الوقف (Trailing)
         self.trailing_trigger_pct = 0.01  # تفعيل عند ربح 1%
         self.trailing_offset_pct = 0.005  # الحفاظ على مسافة 0.5% من السعر الحالي
+        # إدارة المخاطر المتقدمة
+        self.daily_profit_target = 0.05 # 5% daily profit target
+        self.daily_loss_limit = 0.02 # 2% daily loss limit
+        self.current_day = datetime.now().day
+        self.today_profit = 0.0
+        self.today_loss = 0.0
+
+    def _reset_daily_stats(self):
+        if datetime.now().day != self.current_day:
+            self.current_day = datetime.now().day
+            self.today_profit = 0.0
+            self.today_loss = 0.0
+            logger.info("Daily stats reset.")
 
     def set_pending_retest(self, side: str, level: float, timestamp: float):
+        self._reset_daily_stats()
+        if self.today_profit >= self.daily_profit_target or self.today_loss >= self.daily_loss_limit:
+            logger.warning("Daily profit target or loss limit reached. Skipping new pending retest.")
+            send_telegram_message(self.tg_token, self.tg_chat_id, "⚠️ *تنبيه المخاطر*: تم الوصول إلى حد الربح/الخسارة اليومي. لن يتم فتح صفقات جديدة اليوم.")
+            return
+
         self.pending_retest = {
             "side": side,
             "level": level,
@@ -117,9 +59,16 @@ class TradeManager:
         }
         msg = f"🔍 *رصد كسر للمستوى ({side})*\n📏 المستوى: {level:.2f}\n⏳ بانتظار إعادة الاختبار (Retest)..."
         send_telegram_message(self.tg_token, self.tg_chat_id, msg)
+        logger.info(f"Pending retest set: {side} at {level:.2f}")
 
     def open_position(self, side: str, entry_price: float, stop_price: float, 
                      tp_price: float, qty: float, timestamp: float) -> Dict:
+        self._reset_daily_stats()
+        if self.today_profit >= self.daily_profit_target or self.today_loss >= self.daily_loss_limit:
+            logger.warning("Daily profit target or loss limit reached. Skipping opening new position.")
+            send_telegram_message(self.tg_token, self.tg_chat_id, "⚠️ *تنبيه المخاطر*: تم الوصول إلى حد الربح/الخسارة اليومي. لن يتم فتح صفقات جديدة اليوم.")
+            return None
+
         self.open_trade = {
             "side": side,
             "entry_price": entry_price,
@@ -136,6 +85,7 @@ class TradeManager:
         self.pending_retest = None
         msg = f"🚀 *تم تأكيد إعادة الاختبار - فتح صفقة ({side})*\n💰 السعر: {entry_price:.2f}\n🛑 الوقف: {stop_price:.2f}\n🎯 الهدف: {tp_price:.2f}\n📦 الكمية: {qty}"
         send_telegram_message(self.tg_token, self.tg_chat_id, msg)
+        logger.info(f"Position opened: {side} at {entry_price:.2f}, SL: {stop_price:.2f}, TP: {tp_price:.2f}, Qty: {qty}")
         return self.open_trade
 
     def check_close_conditions(self, current_price: float, timestamp: float) -> Optional[Dict]:
@@ -175,10 +125,14 @@ class TradeManager:
             if profit_pct >= self.trailing_trigger_pct:
                 new_stop = current_price * (1 - self.trailing_offset_pct)
                 if new_stop > trade["stop_price"]:
+                    old_stop = trade["stop_price"]
                     trade["stop_price"] = new_stop
                     if not trade["is_trailing"]:
                         trade["is_trailing"] = True
                         send_telegram_message(self.tg_token, self.tg_chat_id, f"🎯 *تفعيل تتبع الوقف*\nتم تأمين الربح عند: {new_stop:.2f}")
+                        logger.info(f"Trailing stop activated for BUY. New stop: {new_stop:.2f}")
+                    elif new_stop > old_stop:
+                        logger.info(f"Trailing stop updated for BUY. Old stop: {old_stop:.2f}, New stop: {new_stop:.2f}")
         
         elif trade["side"] == "SELL":
             if current_price < trade["lowest_price"]:
@@ -187,10 +141,14 @@ class TradeManager:
             if profit_pct >= self.trailing_trigger_pct:
                 new_stop = current_price * (1 + self.trailing_offset_pct)
                 if new_stop < trade["stop_price"]:
+                    old_stop = trade["stop_price"]
                     trade["stop_price"] = new_stop
                     if not trade["is_trailing"]:
                         trade["is_trailing"] = True
                         send_telegram_message(self.tg_token, self.tg_chat_id, f"🎯 *تفعيل تتبع الوقف*\nتم تأمين الربح عند: {new_stop:.2f}")
+                        logger.info(f"Trailing stop activated for SELL. New stop: {new_stop:.2f}")
+                    elif new_stop < old_stop:
+                        logger.info(f"Trailing stop updated for SELL. Old stop: {old_stop:.2f}, New stop: {new_stop:.2f}")
 
     def _close_trade(self, exit_price: float, timestamp: float, reason: str, pnl: float) -> Dict:
         trade = self.open_trade.copy()
@@ -201,47 +159,84 @@ class TradeManager:
         trade["status"] = "CLOSED"
         self.closed_trades.append(trade)
         status_emoji = "✅" if pnl > 0 else "❌"
-        msg = f"{status_emoji} *إغلاق صفقة ({trade['side']})*\n📝 السبب: {reason}\n📉 السعر: {exit_price:.2f}\n💵 الربح/الخسارة: {pnl:.2f}$"
+        msg = f"{status_emoji} *إغلاق صفقة ({trade["side"]})*\n📝 السبب: {reason}\n📉 السعر: {exit_price:.2f}\n💵 الربح/الخسارة: {pnl:.2f}$"
         send_telegram_message(self.tg_token, self.tg_chat_id, msg)
+        logger.info(f"Trade closed: {trade["side"]} at {exit_price:.2f}, PnL: {pnl:.2f}, Reason: {reason}")
         if pnl > 0:
             self.total_profit += pnl
             self.win_count += 1
+            self.today_profit += pnl
         else:
             self.total_loss += abs(pnl)
             self.loss_count += 1
+            self.today_loss += abs(pnl)
         self.open_trade = None
         return trade
 
 # ===== Strategy Logic =====
 def detect_equal_lows(df: pd.DataFrame) -> pd.Series:
+    # Ensure enough data for rolling window
+    if len(df) < 3:
+        return pd.Series(dtype=float)
     lows = df["low"].rolling(3).agg(lambda x: x.iloc[1] if x.iloc[1] == x.min() else np.nan)
     return lows.dropna()
 
 def detect_equal_highs(df: pd.DataFrame) -> pd.Series:
+    # Ensure enough data for rolling window
+    if len(df) < 3:
+        return pd.Series(dtype=float)
     highs = df["high"].rolling(3).agg(lambda x: x.iloc[1] if x.iloc[1] == x.max() else np.nan)
     return highs.dropna()
 
 def check_breakout_signal(df: pd.DataFrame, volume_mult: float = 1.5) -> Tuple[bool, str, Optional[float]]:
+    if df.empty:
+        return False, "", None
+
+    # Add SMA filter
+    df['SMA'] = calculate_sma(df, window=20)
+    if df['SMA'].isnull().any(): # Not enough data for SMA
+        logger.warning("Not enough data to calculate SMA. Skipping signal check.")
+        return False, "", None
+
+    current_price = df['close'].iloc[-1]
+    current_sma = df['SMA'].iloc[-1]
+
     equal_lows = detect_equal_lows(df)
     if len(equal_lows) >= 1:
         last_equal = equal_lows.iloc[-1]
-        avg_volume = df["volume"].rolling(20).mean().iloc[-1]
-        if df["low"].iloc[-1] < last_equal and df["volume"].iloc[-1] > avg_volume * volume_mult:
+        # Ensure enough data for rolling mean
+        if len(df) < 20:
+            avg_volume = df["volume"].mean()
+        else:
+            avg_volume = df["volume"].rolling(20).mean().iloc[-1]
+
+        # Add SMA filter for BUY signal: price should be above SMA
+        if current_price > current_sma and df["low"].iloc[-1] < last_equal and df["volume"].iloc[-1] > avg_volume * volume_mult:
+            logger.info(f"Potential BUY signal detected at {last_equal:.2f} with volume confirmation and SMA filter.")
             return True, "BUY", last_equal
             
     equal_highs = detect_equal_highs(df)
     if len(equal_highs) >= 1:
         last_equal = equal_highs.iloc[-1]
-        avg_volume = df["volume"].rolling(20).mean().iloc[-1]
-        if df["high"].iloc[-1] > last_equal and df["volume"].iloc[-1] > avg_volume * volume_mult:
+        # Ensure enough data for rolling mean
+        if len(df) < 20:
+            avg_volume = df["volume"].mean()
+        else:
+            avg_volume = df["volume"].rolling(20).mean().iloc[-1]
+
+        # Add SMA filter for SELL signal: price should be below SMA
+        if current_price < current_sma and df["high"].iloc[-1] > last_equal and df["volume"].iloc[-1] > avg_volume * volume_mult:
+            logger.info(f"Potential SELL signal detected at {last_equal:.2f} with volume confirmation and SMA filter.")
             return True, "SELL", last_equal
             
     return False, "", None
 
 def calc_position_size(balance: float, entry_price: float, stop_price: float, risk_pct: float = 0.01) -> float:
+    if stop_price == entry_price:
+        return 0.0 # Avoid division by zero
     risk_amount = balance * risk_pct
     risk_per_unit = abs(entry_price - stop_price)
-    if risk_per_unit == 0: return 0
+    if risk_per_unit == 0: return 0.0
     return round(risk_amount / risk_per_unit, 6)
 
 # ===== Main Bot Class =====
@@ -259,43 +254,86 @@ class EqualLevelsBot:
         self.lookback = lookback
         self.client_manager = BinanceClientManager(api_key, api_secret)
         self.trade_manager = TradeManager(tg_token, tg_chat_id)
+        logger.info(f"Bot initialized for {symbol} on {timeframe} with RR: {rr_ratio}, Risk: {risk_pct}")
 
     def run_iteration(self):
+        logger.info(f"Running iteration for {self.symbol}...")
+        self.trade_manager._reset_daily_stats() # Reset daily stats at the start of each iteration
+
+        # Check if daily loss limit or profit target is reached
+        if self.trade_manager.today_loss >= self.trade_manager.daily_loss_limit:
+            logger.warning("Daily loss limit reached. Bot will not open new trades today.")
+            send_telegram_message(self.trade_manager.tg_token, self.trade_manager.tg_chat_id, "❌ *تنبيه المخاطر*: تم الوصول إلى حد الخسارة اليومي. لن يتم فتح صفقات جديدة اليوم.")
+            return
+        if self.trade_manager.today_profit >= self.trade_manager.daily_profit_target:
+            logger.warning("Daily profit target reached. Bot will not open new trades today.")
+            send_telegram_message(self.trade_manager.tg_token, self.trade_manager.tg_chat_id, "✅ *تنبيه الأرباح*: تم الوصول إلى هدف الربح اليومي. لن يتم فتح صفقات جديدة اليوم.")
+            return
+
         df = self.client_manager.get_klines(self.symbol, self.timeframe, self.lookback)
-        if df is None: return
+        if df is None or df.empty:
+            logger.warning("No klines data received. Skipping iteration.")
+            return
 
         current_price = df["close"].iloc[-1]
         current_time = datetime.now().timestamp()
 
         if self.trade_manager.open_trade:
+            logger.info(f"Open trade detected. Checking close conditions for {self.symbol}.")
             self.trade_manager.check_close_conditions(current_price, current_time)
             return
 
         pending = self.trade_manager.pending_retest
         if pending:
+            logger.info(f"Pending retest detected for {pending["side"]} at {pending["level"]:.2f}.")
             if current_time > pending["expiry"]:
+                logger.info("Pending retest expired.")
                 self.trade_manager.pending_retest = None
                 return
 
             if pending["side"] == "BUY":
+                # Check for retest within a small range
                 if current_price <= pending["level"] * 1.002 and current_price >= pending["level"] * 0.998:
                     stop = pending["level"] - (current_price * 0.003) # Slightly wider stop for 5m
                     balance = self.client_manager.get_balance()
+                    if balance <= 0:
+                        logger.error("Insufficient balance to open a BUY position.")
+                        send_telegram_message(self.trade_manager.tg_chat_id, self.trade_manager.tg_chat_id, "❌ *خطأ*: رصيد غير كافٍ لفتح صفقة شراء.")
+                        return
                     qty = calc_position_size(balance, current_price, stop, self.risk_pct)
+                    if qty <= 0:
+                        logger.warning("Calculated quantity is zero or negative for BUY. Skipping order.")
+                        return
                     tp = current_price + (current_price - stop) * self.rr_ratio
-                    if self.client_manager.create_order(self.symbol, "BUY", qty):
+                    order_result = self.client_manager.create_order(self.symbol, "BUY", qty)
+                    if order_result and order_result.get("status") == "FILLED":
                         self.trade_manager.open_position("BUY", current_price, stop, tp, qty, current_time)
+                    else:
+                        logger.error(f"Failed to open BUY order: {order_result}")
             
             elif pending["side"] == "SELL":
+                # Check for retest within a small range
                 if current_price >= pending["level"] * 0.998 and current_price <= pending["level"] * 1.002:
                     stop = pending["level"] + (current_price * 0.003)
                     balance = self.client_manager.get_balance()
+                    if balance <= 0:
+                        logger.error("Insufficient balance to open a SELL position.")
+                        send_telegram_message(self.trade_manager.tg_chat_id, self.trade_manager.tg_chat_id, "❌ *خطأ*: رصيد غير كافٍ لفتح صفقة بيع.")
+                        return
                     qty = calc_position_size(balance, current_price, stop, self.risk_pct)
+                    if qty <= 0:
+                        logger.warning("Calculated quantity is zero or negative for SELL. Skipping order.")
+                        return
                     tp = current_price - (stop - current_price) * self.rr_ratio
-                    if self.client_manager.create_order(self.symbol, "SELL", qty):
+                    order_result = self.client_manager.create_order(self.symbol, "SELL", qty)
+                    if order_result and order_result.get("status") == "FILLED":
                         self.trade_manager.open_position("SELL", current_price, stop, tp, qty, current_time)
+                    else:
+                        logger.error(f"Failed to open SELL order: {order_result}")
             return
 
         has_signal, side, level = check_breakout_signal(df, self.volume_mult)
         if has_signal:
             self.trade_manager.set_pending_retest(side, level, current_time)
+        else:
+            logger.info("No new signal detected.")

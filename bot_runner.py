@@ -1,18 +1,19 @@
-"""
-تشغيل البوت على Render / VPS - مع دعم كامل لمتغيرات البيئة وتلجرام
-Bot Runner for Continuous Execution with Telegram
-"""
-
 import os
 import time
 import logging
 from datetime import datetime
-from improved_equal_levels_bot import EqualLevelsBot, send_telegram_message
+
+from improved_equal_levels_bot import EqualLevelsBot
+from telegram_notifier import send_telegram_message
 
 # إعداد السجلات (Logging)
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("bot_log.log"),
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
 
@@ -38,7 +39,7 @@ def main():
         mode = "حقيقي ✅" if api_key else "تجريبي (محاكاة) 🧪"
         start_msg = f"🤖 *تم بدء تشغيل البوت على Render*\n📈 الزوج: {symbol}\n⏰ الإطار: {timeframe}\n⚙️ الوضع: {mode}"
         send_telegram_message(tg_token, tg_chat_id, start_msg)
-
+    
     # إنشاء البوت
     try:
         bot = EqualLevelsBot(
@@ -55,25 +56,31 @@ def main():
         )
         logger.info("✅ تم بناء محرك البوت بنجاح")
     except Exception as e:
-        logger.error(f"❌ خطأ في إنشاء البوت: {e}")
+        logger.critical(f"❌ خطأ حرج في إنشاء البوت: {e}")
         if tg_token and tg_chat_id:
             send_telegram_message(tg_token, tg_chat_id, f"❌ *خطأ حرج عند بدء البوت:*\n`{str(e)}`")
         return
-
+    
     # حلقة التشغيل اللانهائية
     iteration = 0
     while True:
         try:
             iteration += 1
+            logger.info(f"--- بدء الدورة #{iteration} ---")
             bot.run_iteration()
+            logger.info(f"--- انتهاء الدورة #{iteration} ---")
             time.sleep(60)
             
         except KeyboardInterrupt:
             logger.info("⛔ تم إيقاف البوت يدوياً")
+            if tg_token and tg_chat_id:
+                send_telegram_message(tg_token, tg_chat_id, "⛔ *تم إيقاف البوت يدوياً*")
             break
         except Exception as e:
             logger.error(f"❌ خطأ في الدورة #{iteration}: {e}")
-            time.sleep(30)
+            if tg_token and tg_chat_id:
+                send_telegram_message(tg_token, tg_chat_id, f"❌ *خطأ في دورة البوت #{iteration}:*\n`{str(e)}`")
+            time.sleep(30) # انتظار قبل المحاولة مرة أخرى
 
 if __name__ == "__main__":
     main()
