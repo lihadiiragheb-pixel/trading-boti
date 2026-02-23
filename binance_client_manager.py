@@ -5,6 +5,7 @@ from datetime import datetime
 from binance.client import Client
 from binance.enums import *
 import logging
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -12,6 +13,8 @@ class BinanceClientManager:
     def __init__(self, api_key: str = "", api_secret: str = ""):
         self.api_key = api_key
         self.api_secret = api_secret
+        self.retry_count = 3 # Number of retries for API calls
+        self.base_delay = 1 # Base delay in seconds for exponential backoff
         if api_key and api_secret:
             self.client = Client(api_key, api_secret)
             logger.info("✅ تم الاتصال ببايننس بنجاح (حساب حقيقي)")
@@ -23,18 +26,20 @@ class BinanceClientManager:
         if not self.client:
             return self._get_simulated_klines(limit)
         
-        try:
-            data = self.client.get_klines(symbol=symbol, interval=interval, limit=limit)
-            df = pd.DataFrame(data, columns=[
-                "open_time", "open", "high", "low", "close",
-                "volume", "close_time", "qav", "trades", "bav", "qbv", "ignore"
-            ])
-            for col in ["open", "high", "low", "close", "volume"]:
-                df[col] = df[col].astype(float)
-            return df
-        except Exception as e:
-            logger.error(f"❌ خطأ في جلب البيانات من بينانس: {e}")
-            return None
+        for i in range(self.retry_count):
+            try:
+                data = self.client.get_klines(symbol=symbol, interval=interval, limit=limit)
+                df = pd.DataFrame(data, columns=[
+                    "open_time", "open", "high", "low", "close",
+                    "volume", "close_time", "qav", "trades", "bav", "qbv", "ignore"
+                ])
+                for col in ["open", "high", "low", "close", "volume"]:
+                    df[col] = df[col].astype(float)
+                return df
+            except Exception as e:
+                logger.error(f"❌ خطأ في جلب البيانات من بينانس (المحاولة {i+1}/{self.retry_count}): {e}")
+                time.sleep(self.base_delay * (2 ** i)) # Exponential backoff
+        return None
 
     def get_historical_klines(self, symbol, interval, start_str, end_str=None):
         if not self.client:
@@ -42,20 +47,22 @@ class BinanceClientManager:
             # Fallback to simulated data if no API keys for historical data
             return self._get_simulated_klines(500) # Return a reasonable amount of simulated data
 
-        try:
-            data = self.client.get_historical_klines(symbol, interval, start_str, end_str)
-            df = pd.DataFrame(data, columns=[
-                "open_time", "open", "high", "low", "close",
-                "volume", "close_time", "qav", "trades", "bav", "qbv", "ignore"
-            ])
-            for col in ["open", "high", "low", "close", "volume"]:
-                df[col] = df[col].astype(float)
-            df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
-            df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
-            return df
-        except Exception as e:
-            logger.error(f"❌ خطأ في جلب البيانات التاريخية من بينانس: {e}")
-            return None
+        for i in range(self.retry_count):
+            try:
+                data = self.client.get_historical_klines(symbol, interval, start_str, end_str)
+                df = pd.DataFrame(data, columns=[
+                    "open_time", "open", "high", "low", "close",
+                    "volume", "close_time", "qav", "trades", "bav", "qbv", "ignore"
+                ])
+                for col in ["open", "high", "low", "close", "volume"]:
+                    df[col] = df[col].astype(float)
+                df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+                df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
+                return df
+            except Exception as e:
+                logger.error(f"❌ خطأ في جلب البيانات التاريخية من بينانس (المحاولة {i+1}/{self.retry_count}): {e}")
+                time.sleep(self.base_delay * (2 ** i))
+        return None
 
     def _get_simulated_klines(self, limit):
         # Improved simulated klines for better backtesting

@@ -58,6 +58,8 @@ def main():
             volume_mult=volume_mult,
             risk_pct=risk_pct,
             lookback=lookback,
+            level_window=int(os.getenv("LEVEL_WINDOW", "5")),
+            level_tolerance_pct=float(os.getenv("LEVEL_TOLERANCE_PCT", "0.0005")),
             api_key=api_key,
             api_secret=api_secret,
             tg_token=tg_token,
@@ -85,11 +87,13 @@ def main():
             logger.info("⛔ تم إيقاف البوت يدوياً")
             if tg_token and tg_chat_id:
                 send_telegram_message(tg_token, tg_chat_id, "⛔ *تم إيقاف البوت يدوياً*")
+            bot.trade_manager.save_state() # Save state before exiting
             break
         except Exception as e:
             logger.error(f"❌ خطأ في الدورة #{iteration}: {e}")
             if tg_token and tg_chat_id:
                 send_telegram_message(tg_token, tg_chat_id, f"❌ *خطأ في دورة البوت #{iteration}:*\n`{str(e)}`")
+            bot.trade_manager.save_state() # Save state before attempting to restart or exit
             time.sleep(30) # انتظار قبل المحاولة مرة أخرى
 
 if __name__ == "__main__":
