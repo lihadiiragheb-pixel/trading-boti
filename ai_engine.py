@@ -6,21 +6,17 @@ logger = logging.getLogger(__name__)
 
 class AIEngine:
     def __init__(self):
-        self.client = None
         api_key = os.getenv("OPENAI_API_KEY")
-        if api_key:
-            try:
-                self.client = OpenAI(api_key=api_key)
-                logger.info("✅ تم تهيئة عميل OpenAI بنجاح.")
-            except Exception as e:
-                logger.error(f"❌ خطأ في تهيئة عميل OpenAI: {e}")
-        else:
-            logger.warning("⚠️ لم يتم توفير مفتاح OPENAI_API_KEY. لن يتم استخدام وظائف الذكاء الاصطناعي.")
+        # bot_runner.py already ensures api_key is present, so we can directly initialize
+        try:
+            self.client = OpenAI(api_key=api_key)
+            logger.info("✅ تم تهيئة عميل OpenAI بنجاح.")
+        except Exception as e:
+            logger.critical(f"❌ خطأ حرج في تهيئة عميل OpenAI: {e}. يرجى التحقق من مفتاح API.")
+            # Re-raise the exception as it's a critical failure if bot_runner didn't catch it
+            raise
 
     def get_market_sentiment(self, news_headlines: str) -> str:
-        if not self.client:
-            return "neutral"
-        
         try:
             response = self.client.chat.completions.create(
                 model="gpt-4.1-mini", # Using a suitable model for sentiment analysis
@@ -39,7 +35,7 @@ class AIEngine:
                 logger.warning(f"Unexpected sentiment response from OpenAI: {sentiment}. Defaulting to neutral.")
                 return "neutral"
         except Exception as e:
-            logger.error(f"❌ خطأ في تحليل المشاعر باستخدام OpenAI: {e}")
+            logger.error(f"❌ خطأ في تحليل المشاعر باستخدام OpenAI: {e}. العودة إلى المشاعر المحايدة.")
             return "neutral"
 
     # Placeholder for future price prediction or parameter optimization functions

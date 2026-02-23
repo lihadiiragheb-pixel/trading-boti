@@ -9,7 +9,7 @@ from telegram_notifier import send_telegram_message
 # إعداد السجلات (Logging)
 logging.basicConfig(
     level=logging.INFO,
-    format=\'%(asctime)s - %(levelname)s - %(message)s\',
+    format=\'%(asctime)s - %(levelname)s - %(message)s\
     handlers=[
         logging.FileHandler("bot_log.log"),
         logging.StreamHandler()
@@ -33,8 +33,16 @@ def main():
     volume_mult = float(os.getenv("VOLUME_MULT", "1.5"))
     risk_pct = float(os.getenv("RISK_PCT", "0.005"))
     lookback = int(os.getenv("LOOKBACK", "50"))
-    openai_api_key = os.getenv("OPENAI_API_KEY", "") # Get OpenAI API Key
-    
+    openai_api_key = os.getenv("OPENAI_API_KEY") # Get OpenAI API Key
+
+    # التحقق من وجود مفتاح OpenAI API
+    if not openai_api_key:
+        error_msg = "❌ خطأ حرج: مفتاح OPENAI_API_KEY غير موجود. لا يمكن تشغيل البوت بدون الذكاء الاصطناعي."
+        logger.critical(error_msg)
+        if tg_token and tg_chat_id:
+            send_telegram_message(tg_token, tg_chat_id, error_msg)
+        return # إنهاء البرنامج إذا كان المفتاح غير موجود
+
     # إرسال إشعار بدء التشغيل لتلجرام
     if tg_token and tg_chat_id:
         mode = "حقيقي ✅" if api_key else "تجريبي (محاكاة) 🧪"
