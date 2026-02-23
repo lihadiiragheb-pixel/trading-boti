@@ -336,10 +336,16 @@ class EqualLevelsBot:
             return
 
         current_price = df["close"].iloc[-1]
-        current_time = df["close_time"].iloc[-1].timestamp()
+        # Convert close_time to timestamp (it might be a numpy.int64 or datetime)
+        last_close_time = df["close_time"].iloc[-1]
+        if isinstance(last_close_time, (int, np.int64)):
+            current_time = float(last_close_time) / 1000.0 # Binance timestamps are in ms
+        else:
+            current_time = last_close_time.timestamp()
 
         market_news = self._fetch_market_news()
         market_sentiment = self.ai_engine.get_market_sentiment(market_news)
+        logger.info(f"Checking for signals with sentiment: {market_sentiment}")
         has_signal, side, level = check_breakout_signal(df, self.volume_mult, market_sentiment, self.level_window, self.level_tolerance_pct)
         if has_signal:
             # Check if there's an existing pending retest for the same level and side
@@ -355,16 +361,16 @@ class EqualLevelsBot:
             pending_retest = self.trade_manager.pending_retest
             # Check if pending retest has expired
             if current_time > pending_retest["expiry"]:
-                logger.info(f"Pending retest for {pending_retest["side"]} at {pending_retest["level"]:.2f} expired.")
-                send_telegram_message(self.trade_manager.tg_token, self.trade_manager.tg_chat_id, f"⏰ *إلغاء إعادة الاختبار*: انتهت صلاحية إعادة اختبار المستوى {pending_retest["level"]:.2f} ({pending_retest["side"]}).")
+                logger.info(f"Pending retest for {pending_retest['side']} at {pending_retest['level']:.2f} expired.")
+                send_telegram_message(self.trade_manager.tg_token, self.trade_manager.tg_chat_id, f"⏰ *إلغاء إعادة الاختبار*: انتهت صلاحية إعادة اختبار المستوى {pending_retest['level']:.2f} ({pending_retest['side']}).")
                 self.trade_manager.pending_retest = None
                 self.trade_manager.save_state() # Save state after clearing pending retest
             else:
                 # Check sentiment before confirming retest
                 if (pending_retest["side"] == "BUY" and market_sentiment == "bearish") or \
                    (pending_retest["side"] == "SELL" and market_sentiment == "bullish"):
-                    logger.warning(f"Pending retest for {pending_retest["side"]} at {pending_retest["level"]:.2f} cancelled due to adverse market sentiment ({market_sentiment}).")
-                    send_telegram_message(self.trade_manager.tg_token, self.trade_manager.tg_chat_id, f"🚫 *إلغاء إعادة الاختبار*: تم إلغاء إعادة اختبار المستوى {pending_retest["level"]:.2f} ({pending_retest["side"]}) بسبب مشاعر السوق السلبية ({market_sentiment}).")
+                    logger.warning(f"Pending retest for {pending_retest['side']} at {pending_retest['level']:.2f} cancelled due to adverse market sentiment ({market_sentiment}).")
+                    send_telegram_message(self.trade_manager.tg_token, self.trade_manager.tg_chat_id, f"🚫 *إلغاء إعادة الاختبار*: تم إلغاء إعادة اختبار المستوى {pending_retest['level']:.2f} ({pending_retest['side']}) بسبب مشاعر السوق السلبية ({market_sentiment}).")
                     self.trade_manager.pending_retest = None
                     self.trade_manager.save_state() # Save state after clearing pending retest
                 else:
@@ -402,7 +408,8 @@ class EqualLevelsBot:
         # Check for open trade close conditions
         if self.trade_manager.open_trade:
             self.trade_manager.check_close_conditions(current_price, current_time)
-
+        
+        logger.info("Iteration completed successfully.")
         time.sleep(60)
         
 if __name__ == "__main__":
