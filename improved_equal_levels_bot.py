@@ -8,12 +8,13 @@ import logging
 
 from telegram_notifier import send_telegram_message
 from binance_client_manager import BinanceClientManager
+from ai_engine import AIEngine # Import the new AI Engine
 
 logger = logging.getLogger(__name__)
 
 # ===== Utility Functions for Strategy Filters =====
 def calculate_sma(df: pd.DataFrame, window: int = 20) -> pd.Series:
-    return df['close'].rolling(window=window).mean()
+    return df["close"].rolling(window=window).mean()
 
 # ===== Trade Manager Class with Trailing & Retest Support =====
 class TradeManager:
@@ -188,18 +189,18 @@ def detect_equal_highs(df: pd.DataFrame) -> pd.Series:
     highs = df["high"].rolling(3).agg(lambda x: x.iloc[1] if x.iloc[1] == x.max() else np.nan)
     return highs.dropna()
 
-def check_breakout_signal(df: pd.DataFrame, volume_mult: float = 1.5) -> Tuple[bool, str, Optional[float]]:
+def check_breakout_signal(df: pd.DataFrame, volume_mult: float = 1.5, market_sentiment: str = "neutral") -> Tuple[bool, str, Optional[float]]:
     if df.empty:
         return False, "", None
 
     # Add SMA filter
-    df['SMA'] = calculate_sma(df, window=20)
-    if df['SMA'].isnull().any(): # Not enough data for SMA
+    df["SMA"] = calculate_sma(df, window=20)
+    if df["SMA"].isnull().any(): # Not enough data for SMA
         logger.warning("Not enough data to calculate SMA. Skipping signal check.")
         return False, "", None
 
-    current_price = df['close'].iloc[-1]
-    current_sma = df['SMA'].iloc[-1]
+    current_price = df["close"].iloc[-1]
+    current_sma = df["SMA"].iloc[-1]
 
     equal_lows = detect_equal_lows(df)
     if len(equal_lows) >= 1:
@@ -211,8 +212,12 @@ def check_breakout_signal(df: pd.DataFrame, volume_mult: float = 1.5) -> Tuple[b
             avg_volume = df["volume"].rolling(20).mean().iloc[-1]
 
         # Add SMA filter for BUY signal: price should be above SMA
+        # Add sentiment filter: if sentiment is bearish, reduce BUY signal probability
         if current_price > current_sma and df["low"].iloc[-1] < last_equal and df["volume"].iloc[-1] > avg_volume * volume_mult:
-            logger.info(f"Potential BUY signal detected at {last_equal:.2f} with volume confirmation and SMA filter.")
+            if market_sentiment == "bearish":
+                logger.info("Potential BUY signal detected, but bearish sentiment. Skipping.")
+                return False, "", None
+            logger.info(f"Potential BUY signal detected at {last_equal:.2f} with volume confirmation and SMA filter. Sentiment: {market_sentiment}")
             return True, "BUY", last_equal
             
     equal_highs = detect_equal_highs(df)
@@ -225,8 +230,12 @@ def check_breakout_signal(df: pd.DataFrame, volume_mult: float = 1.5) -> Tuple[b
             avg_volume = df["volume"].rolling(20).mean().iloc[-1]
 
         # Add SMA filter for SELL signal: price should be below SMA
+        # Add sentiment filter: if sentiment is bullish, reduce SELL signal probability
         if current_price < current_sma and df["high"].iloc[-1] > last_equal and df["volume"].iloc[-1] > avg_volume * volume_mult:
-            logger.info(f"Potential SELL signal detected at {last_equal:.2f} with volume confirmation and SMA filter.")
+            if market_sentiment == "bullish":
+                logger.info("Potential SELL signal detected, but bullish sentiment. Skipping.")
+                return False, "", None
+            logger.info(f"Potential SELL signal detected at {last_equal:.2f} with volume confirmation and SMA filter. Sentiment: {market_sentiment}")
             return True, "SELL", last_equal
             
     return False, "", None
@@ -245,7 +254,8 @@ class EqualLevelsBot:
                  rr_ratio: float = 2.0, volume_mult: float = 1.5, 
                  risk_pct: float = 0.01, lookback: int = 50,
                  api_key: str = "", api_secret: str = "",
-                 tg_token: str = "", tg_chat_id: str = ""):
+                 tg_token: str = "", tg_chat_id: str = "",
+                 openai_api_key: str = ""):
         self.symbol = symbol
         self.timeframe = timeframe
         self.rr_ratio = rr_ratio
@@ -254,7 +264,22 @@ class EqualLevelsBot:
         self.lookback = lookback
         self.client_manager = BinanceClientManager(api_key, api_secret)
         self.trade_manager = TradeManager(tg_token, tg_chat_id)
+        self.ai_engine = AIEngine() # Initialize AI Engine
         logger.info(f"Bot initialized for {symbol} on {timeframe} with RR: {rr_ratio}, Risk: {risk_pct}")
+
+    def _fetch_market_news(self) -> str:
+        # Placeholder for fetching real market news
+        # In a real scenario, this would integrate with a news API or scrape data.
+        # For demonstration, we return a static string.
+        news_options = [
+            "Bitcoin price surges after positive regulatory news.",
+            "Cryptocurrency market experiences sharp decline due to inflation fears.",
+            "Major exchange announces new altcoin listing, boosting market confidence.",
+            "Global economic uncertainty leads to cautious trading in crypto.",
+            "New decentralized finance (DeFi) project gains traction, positive outlook."
+        ]
+        # Simulate fetching a random news headline for sentiment analysis
+        return np.random.choice(news_options)
 
     def run_iteration(self):
         logger.info(f"Running iteration for {self.symbol}...")
@@ -291,14 +316,26 @@ class EqualLevelsBot:
                 self.trade_manager.pending_retest = None
                 return
 
+            # Get market sentiment before acting on pending retest
+            market_news = self._fetch_market_news()
+            market_sentiment = self.ai_engine.get_market_sentiment(market_news)
+            logger.info(f"Current market sentiment: {market_sentiment}")
+
             if pending["side"] == "BUY":
+                # Apply sentiment filter for BUY retest
+                if market_sentiment == "bearish":
+                    logger.info("Bearish sentiment detected, skipping BUY retest execution.")
+                    send_telegram_message(self.trade_manager.tg_token, self.trade_manager.tg_chat_id, "⚠️ *تنبيه الذكاء الاصطناعي*: مشاعر السوق سلبية، تم إلغاء إعادة اختبار الشراء.")
+                    self.trade_manager.pending_retest = None # Clear pending retest if sentiment is against it
+                    return
+                
                 # Check for retest within a small range
                 if current_price <= pending["level"] * 1.002 and current_price >= pending["level"] * 0.998:
                     stop = pending["level"] - (current_price * 0.003) # Slightly wider stop for 5m
                     balance = self.client_manager.get_balance()
                     if balance <= 0:
                         logger.error("Insufficient balance to open a BUY position.")
-                        send_telegram_message(self.trade_manager.tg_chat_id, self.trade_manager.tg_chat_id, "❌ *خطأ*: رصيد غير كافٍ لفتح صفقة شراء.")
+                        send_telegram_message(self.trade_manager.tg_token, self.trade_manager.tg_chat_id, "❌ *خطأ*: رصيد غير كافٍ لفتح صفقة شراء.")
                         return
                     qty = calc_position_size(balance, current_price, stop, self.risk_pct)
                     if qty <= 0:
@@ -312,13 +349,20 @@ class EqualLevelsBot:
                         logger.error(f"Failed to open BUY order: {order_result}")
             
             elif pending["side"] == "SELL":
+                # Apply sentiment filter for SELL retest
+                if market_sentiment == "bullish":
+                    logger.info("Bullish sentiment detected, skipping SELL retest execution.")
+                    send_telegram_message(self.trade_manager.tg_token, self.trade_manager.tg_chat_id, "⚠️ *تنبيه الذكاء الاصطناعي*: مشاعر السوق إيجابية، تم إلغاء إعادة اختبار البيع.")
+                    self.trade_manager.pending_retest = None # Clear pending retest if sentiment is against it
+                    return
+
                 # Check for retest within a small range
                 if current_price >= pending["level"] * 0.998 and current_price <= pending["level"] * 1.002:
                     stop = pending["level"] + (current_price * 0.003)
                     balance = self.client_manager.get_balance()
                     if balance <= 0:
                         logger.error("Insufficient balance to open a SELL position.")
-                        send_telegram_message(self.trade_manager.tg_chat_id, self.trade_manager.tg_chat_id, "❌ *خطأ*: رصيد غير كافٍ لفتح صفقة بيع.")
+                        send_telegram_message(self.trade_manager.tg_token, self.trade_manager.tg_chat_id, "❌ *خطأ*: رصيد غير كافٍ لفتح صفقة بيع.")
                         return
                     qty = calc_position_size(balance, current_price, stop, self.risk_pct)
                     if qty <= 0:
@@ -332,7 +376,12 @@ class EqualLevelsBot:
                         logger.error(f"Failed to open SELL order: {order_result}")
             return
 
-        has_signal, side, level = check_breakout_signal(df, self.volume_mult)
+        # Get market sentiment for initial signal detection
+        market_news = self._fetch_market_news()
+        market_sentiment = self.ai_engine.get_market_sentiment(market_news)
+        logger.info(f"Current market sentiment for initial signal: {market_sentiment}")
+
+        has_signal, side, level = check_breakout_signal(df, self.volume_mult, market_sentiment)
         if has_signal:
             self.trade_manager.set_pending_retest(side, level, current_time)
         else:

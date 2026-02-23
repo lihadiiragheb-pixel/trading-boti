@@ -9,7 +9,7 @@ from telegram_notifier import send_telegram_message
 # إعداد السجلات (Logging)
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format=\'%(asctime)s - %(levelname)s - %(message)s\',
     handlers=[
         logging.FileHandler("bot_log.log"),
         logging.StreamHandler()
@@ -33,6 +33,7 @@ def main():
     volume_mult = float(os.getenv("VOLUME_MULT", "1.5"))
     risk_pct = float(os.getenv("RISK_PCT", "0.005"))
     lookback = int(os.getenv("LOOKBACK", "50"))
+    openai_api_key = os.getenv("OPENAI_API_KEY", "") # Get OpenAI API Key
     
     # إرسال إشعار بدء التشغيل لتلجرام
     if tg_token and tg_chat_id:
@@ -52,7 +53,8 @@ def main():
             api_key=api_key,
             api_secret=api_secret,
             tg_token=tg_token,
-            tg_chat_id=tg_chat_id
+            tg_chat_id=tg_chat_id,
+            openai_api_key=openai_api_key # Pass OpenAI API Key
         )
         logger.info("✅ تم بناء محرك البوت بنجاح")
     except Exception as e:

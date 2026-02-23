@@ -3,8 +3,10 @@ import pandas as pd
 from datetime import datetime, timedelta
 from typing import Optional, Tuple, Dict
 import logging
+import random
 
 from binance_client_manager import BinanceClientManager
+from ai_engine import AIEngine # Import the new AI Engine
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +96,7 @@ class FastTradeManager:
             }
 
         # Calculate Max Drawdown
-        equity_curve = pd.Series([t['pnl'] for t in self.closed_trades]).cumsum()
+        equity_curve = pd.Series([t["pnl"] for t in self.closed_trades]).cumsum()
         if not equity_curve.empty:
             peak = equity_curve.expanding(min_periods=1).max()
             drawdown = (equity_curve - peak) / peak
@@ -130,7 +132,10 @@ def detect_equal_highs(df: pd.DataFrame) -> pd.Series:
     highs = df["high"].rolling(3).agg(lambda x: x.iloc[1] if x.iloc[1] == x.max() else np.nan)
     return highs.dropna()
 
-def check_long_signal(df: pd.DataFrame, volume_mult: float = 1.5) -> Tuple[bool, Optional[float]]:
+def calculate_sma(df: pd.DataFrame, window: int = 20) -> pd.Series:
+    return df["close"].rolling(window=window).mean()
+
+def check_long_signal(df: pd.DataFrame, volume_mult: float = 1.5, market_sentiment: str = "neutral") -> Tuple[bool, Optional[float]]:
     if df.empty:
         return False, None
     equal_lows = detect_equal_lows(df)
@@ -146,11 +151,20 @@ def check_long_signal(df: pd.DataFrame, volume_mult: float = 1.5) -> Tuple[bool,
     else:
         avg_volume = df["volume"].rolling(20).mean().iloc[-1]
 
-    if current_low < last_equal and current_volume > avg_volume * volume_mult:
+    # Add SMA filter
+    df["SMA"] = calculate_sma(df, window=20)
+    if df["SMA"].isnull().any():
+        return False, None
+    current_price = df["close"].iloc[-1]
+    current_sma = df["SMA"].iloc[-1]
+
+    if current_price > current_sma and current_low < last_equal and current_volume > avg_volume * volume_mult:
+        if market_sentiment == "bearish":
+            return False, None # Filter out BUY signals if sentiment is bearish
         return True, last_equal
     return False, None
 
-def check_short_signal(df: pd.DataFrame, volume_mult: float = 1.5) -> Tuple[bool, Optional[float]]:
+def check_short_signal(df: pd.DataFrame, volume_mult: float = 1.5, market_sentiment: str = "neutral") -> Tuple[bool, Optional[float]]:
     if df.empty:
         return False, None
     equal_highs = detect_equal_highs(df)
@@ -166,7 +180,16 @@ def check_short_signal(df: pd.DataFrame, volume_mult: float = 1.5) -> Tuple[bool
     else:
         avg_volume = df["volume"].rolling(20).mean().iloc[-1]
 
-    if current_high > last_equal and current_volume > avg_volume * volume_mult:
+    # Add SMA filter
+    df["SMA"] = calculate_sma(df, window=20)
+    if df["SMA"].isnull().any():
+        return False, None
+    current_price = df["close"].iloc[-1]
+    current_sma = df["SMA"].iloc[-1]
+
+    if current_price < current_sma and current_high > last_equal and current_volume > avg_volume * volume_mult:
+        if market_sentiment == "bullish":
+            return False, None # Filter out SELL signals if sentiment is bullish
         return True, last_equal
     return False, None
 
@@ -193,26 +216,13 @@ def run_fast_backtest(symbol: str = "BTCUSDT", timeframe: str = "1h",
     
     client_manager = BinanceClientManager() # No API keys needed for backtesting
     trade_manager = FastTradeManager()
+    ai_engine = AIEngine() # Initialize AI Engine for backtesting sentiment
     initial_balance = 1000.0
     balance = initial_balance
 
     # Fetch historical data
-    # Note: Binance API get_historical_klines requires start_str and optional end_str
-    # The current BinanceClientManager.get_klines does not support date ranges directly.
     # For a proper backtest, a dedicated historical data fetching function is needed.
     # For now, we will simulate fetching a large chunk of data.
-    # In a real scenario, you would use client.get_historical_klines(symbol, interval, start_str, end_str)
-    
-    # Simulating fetching historical data for demonstration. 
-    # In a real implementation, this would be replaced with actual historical data fetching.
-    # For simplicity, let's assume we have a way to get a large DataFrame of historical data.
-    # For this example, we'll use the simulated klines from BinanceClientManager, but extend it.
-    
-    # To get real historical data, you would need to modify BinanceClientManager or add a new function.
-    # Example: client.get_historical_klines(symbol, timeframe, start_date, end_date)
-    
-    # For now, let's use an extended simulated dataset for the backtest.
-    # This is a placeholder and needs to be replaced with actual historical data fetching.
     logger.warning("Using extended simulated data for backtest. Replace with real historical data fetching for accurate results.")
     
     # Generate more simulated data for backtesting over a longer period
@@ -229,17 +239,22 @@ def run_fast_backtest(symbol: str = "BTCUSDT", timeframe: str = "1h",
         current_price = current_df["close"].iloc[-1]
         current_time = current_df["open_time"].iloc[-1] / 1000 # Convert ms to s
 
+        # Simulate fetching market news and getting sentiment for backtest
+        # In a real backtest, this would be more sophisticated, possibly using historical news data.
+        # For simplicity, we'll randomly assign sentiment here.
+        market_sentiment = random.choice(["bullish", "bearish", "neutral"])
+
         # Check for closing conditions first
         if trade_manager.is_position_open():
             closed_trade = trade_manager.check_close_conditions(current_price, current_time)
             if closed_trade:
                 # Update balance based on closed trade PnL
-                balance += closed_trade['pnl']
-                logger.info(f"Trade closed. New balance: {balance:.2f}")
+                balance += closed_trade["pnl"]
+                logger.info(f"Backtest: Trade closed. New balance: {balance:.2f}")
             continue
 
-        # Check for new signals
-        long_signal, long_level = check_long_signal(current_df, volume_mult)
+        # Check for new signals, passing market sentiment
+        long_signal, long_level = check_long_signal(current_df, volume_mult, market_sentiment)
         if long_signal:
             entry_price = current_price
             stop_price = long_level - (current_price * 0.002) # Use current_price for stop calculation
@@ -247,10 +262,10 @@ def run_fast_backtest(symbol: str = "BTCUSDT", timeframe: str = "1h",
             if qty > 0:
                 tp_price = entry_price + (entry_price - stop_price) * rr_ratio
                 trade_manager.open_position("BUY", entry_price, stop_price, tp_price, qty, current_time)
-                logger.info(f"Backtest: Opened BUY position at {entry_price:.2f}")
+                logger.info(f"Backtest: Opened BUY position at {entry_price:.2f} with sentiment {market_sentiment}")
             continue
 
-        short_signal, short_level = check_short_signal(current_df, volume_mult)
+        short_signal, short_level = check_short_signal(current_df, volume_mult, market_sentiment)
         if short_signal:
             entry_price = current_price
             stop_price = short_level + (current_price * 0.002) # Use current_price for stop calculation
@@ -258,7 +273,7 @@ def run_fast_backtest(symbol: str = "BTCUSDT", timeframe: str = "1h",
             if qty > 0:
                 tp_price = entry_price - (stop_price - entry_price) * rr_ratio
                 trade_manager.open_position("SELL", entry_price, stop_price, tp_price, qty, current_time)
-                logger.info(f"Backtest: Opened SELL position at {entry_price:.2f}")
+                logger.info(f"Backtest: Opened SELL position at {entry_price:.2f} with sentiment {market_sentiment}")
             continue
 
     # طباعة النتائج
